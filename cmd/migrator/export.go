@@ -52,10 +52,8 @@ func export(args []string) {
 
 	// прогресс
 	var prog *progress.Reporter
-	if cfg.ProgressEvery > 0 {
-		prog = progress.New(cfg, *minPK, *maxPK, &totalRows, &totalFiles, start)
-		prog.Start(ctx)
-	}
+	prog = progress.New(cfg, *minPK, *maxPK, &totalRows, &totalFiles, start)
+	prog.Start(ctx)
 
 	// экспорт
 	if err := exporter.Run(ctx, db, cfg, shards, &totalRows, &totalFiles); err != nil {
