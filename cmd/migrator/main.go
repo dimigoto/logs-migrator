@@ -14,6 +14,9 @@ func main() {
 		case "load":
 			load(os.Args[2:])
 			return
+		case "migrate":
+			migrate(os.Args[2:])
+			return
 		}
 	}
 	log.Println("Usage:")

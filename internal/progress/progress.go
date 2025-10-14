@@ -17,7 +17,7 @@ const progressEvery = 1 * time.Second
 
 type Reporter struct {
 	cfg         config.ExportConfig
-	min, max    int64
+	min, max    uint64
 	rowsPtr     *uint64
 	filesPtr    *uint64
 	start       time.Time
@@ -26,7 +26,7 @@ type Reporter struct {
 	progressTkr *time.Ticker
 }
 
-func New(cfg config.ExportConfig, min, max int64, rowsPtr, filesPtr *uint64, start time.Time) *Reporter {
+func New(cfg config.ExportConfig, min, max uint64, rowsPtr, filesPtr *uint64, start time.Time) *Reporter {
 	return &Reporter{
 		cfg:      cfg,
 		min:      min,

@@ -35,7 +35,7 @@ func export(args []string) {
 	defer db.Close()
 
 	// диапазон PK
-	minPK, maxPK := dbx.MustPKRange(ctx, db, cfg)
+	minPK, maxPK := dbx.MustPKRange(ctx, db, cfg.Table, cfg.PK, cfg.Where)
 	if minPK == nil || maxPK == nil || *maxPK < *minPK {
 		log.Println("[INFO] No rows.")
 		return
@@ -44,7 +44,7 @@ func export(args []string) {
 	log.Printf("[INFO] PK range: [%d..%d]", *minPK, *maxPK)
 
 	// шардируем
-	shards := ranger.Split(*minPK, *maxPK, cfg.Workers)
+	shards := ranger.Split(*minPK, *maxPK, uint64(cfg.Workers))
 
 	// метрики экспорта
 	var totalRows, totalFiles uint64

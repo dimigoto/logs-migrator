@@ -26,6 +26,16 @@ func Ident(s string) string {
 	return "`" + s + "`"
 }
 
+func IdentAll(s []string) []string {
+	result := make([]string, 0)
+
+	for _, v := range s {
+		result = append(result, Ident(v))
+	}
+
+	return result
+}
+
 func IndexOf(arr []string, want string) int {
 	for i, v := range arr {
 		if strings.EqualFold(v, want) {

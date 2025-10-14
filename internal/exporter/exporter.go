@@ -31,7 +31,7 @@ func Run(
 	for i, sh := range shards {
 		wg.Add(1)
 
-		go func(wid int, from, to int64) {
+		go func(wid int, from, to uint64) {
 			defer wg.Done()
 			if err := runWorker(ctx, db, cfg, wid, from, to, totalRows, totalFiles); err != nil {
 				errCh <- fmt.Errorf("worker %d: %w", wid, err)
@@ -55,7 +55,7 @@ func runWorker(
 	db *sql.DB,
 	cfg config.ExportConfig,
 	wid int,
-	from, to int64,
+	from, to uint64,
 	totalRows, totalFiles *uint64,
 ) error {
 	log.Printf("[W%d] range [%d..%d]", wid, from, to)
@@ -128,7 +128,7 @@ func runWorker(
 				}
 			}
 
-			if pk, _ := strconv.ParseInt(rec[pkIdx], 10, 64); pk > last {
+			if pk, _ := strconv.ParseUint(rec[pkIdx], 10, 64); pk > last {
 				last = pk
 			}
 
