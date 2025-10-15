@@ -3,26 +3,18 @@ package migrator
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"logs-migrator/internal/config"
-	"logs-migrator/internal/csv"
 	"logs-migrator/internal/dbx"
 	"logs-migrator/internal/ranger"
+	"logs-migrator/internal/stagewriter"
 	"logs-migrator/internal/util"
-	"logs-migrator/internal/uuidv7"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-)
-
-const (
-	dateLayout = "2006-01-02 15:04:05"
 )
 
 func Run(
@@ -30,7 +22,7 @@ func Run(
 	srcDb,
 	dstDb *sql.DB,
 	secureDir string,
-	cfg config.MigrateConfig,
+	cfg config.Config,
 ) error {
 	// Определяем минимальный и максимальный ID записей, которые нужно мигрировать
 	minPk, maxPk, err := getMinMaxNID(ctx, srcDb, dstDb, cfg)
@@ -40,12 +32,16 @@ func Run(
 	log.Printf("[INFO] numeric ID range: %d - %d\n", minPk, maxPk)
 
 	// Разбиваем на шарды
-	shards := ranger.SplitByLimit(minPk, maxPk, uint64(cfg.ChunkSize))
+	shards := ranger.Split(minPk, maxPk, uint64(cfg.ChunkSize))
 	log.Printf("[INFO] shards: %d\n", len(shards))
 
 	// Получаем список колонок табьлицы-источника и целеной таблицы
 	srcTableColumns := dbx.MustTableColumns(ctx, srcDb, cfg.SrcTable)
 	dstTableColumns := dbx.MustTableColumns(ctx, dstDb, cfg.DstTable)
+
+	// Оборачиваем родительский контекст для воркеров
+	workersCtx, cancelWork := context.WithCancel(ctx)
+	defer cancelWork()
 
 	// Создаем очереди
 	stageJobs := make(chan ranger.Range, len(shards))
@@ -58,11 +54,13 @@ func Run(
 	var filesStaged atomic.Uint64
 	var filesLoaded atomic.Uint64
 
-	// Включаем Fast-load
-	dbx.EnableFastLoad(ctx, dstDb)
-	defer func() {
-		dbx.DisableFastLoad(dstDb)
-	}()
+	// Включаем Fast-load если указан флаг
+	if cfg.UseFastLoad {
+		originalSettings := dbx.EnableFastLoad(ctx, dstDb, cfg.InnodbBufferPoolSize, cfg.InnodbIOCapacity, cfg.InnodbIOCapacityMax)
+		defer func() {
+			dbx.DisableFastLoad(dstDb, originalSettings)
+		}()
+	}
 
 	// Фиксируем время старта
 	start := time.Now()
@@ -74,9 +72,10 @@ func Run(
 		id := i + 1
 		go func(id int) {
 			defer stageWG.Done()
-			if err := runStageWorker(ctx, id, srcDb, srcTableColumns, cfg, secureDir, stageJobs, loadJobs, &totalStaged, &filesStaged); err != nil {
+			if err := runStageWorker(workersCtx, id, srcDb, srcTableColumns, cfg, secureDir, stageJobs, loadJobs, &totalStaged, &filesStaged); err != nil {
 				select {
 				case errs <- err:
+					cancelWork()
 				default:
 				}
 			}
@@ -90,9 +89,10 @@ func Run(
 		id := i + 1
 		go func(id int) {
 			defer loadWG.Done()
-			if err := runLoadWorker(ctx, id, dstDb, dstTableColumns, cfg, loadJobs, &totalLoaded, &filesLoaded); err != nil {
+			if err := runLoadWorker(workersCtx, id, dstDb, dstTableColumns, cfg, loadJobs, &totalLoaded, &filesLoaded); err != nil {
 				select {
 				case errs <- err:
+					cancelWork()
 				default:
 				}
 			}
@@ -118,6 +118,7 @@ func Run(
 	// Ждём когда завершится этап загрузки
 	loadWG.Wait()
 
+	// Печатаем статистику. Если в канале с ошибками есть записи, то пишем, что миграция не удалась
 	close(errs)
 	if e := <-errs; e != nil {
 		printStats(start, filesStaged.Load(), totalStaged.Load(), filesLoaded.Load(), totalLoaded.Load(), true)
@@ -141,7 +142,7 @@ func runStageWorker(
 	id int,
 	src *sql.DB,
 	columns []string,
-	cfg config.MigrateConfig,
+	cfg config.Config,
 	secureDir string,
 	in <-chan ranger.Range,
 	out chan<- loadJob,
@@ -154,6 +155,7 @@ func runStageWorker(
 		return err
 	}
 
+	// Слушаем job'ы из канала in
 	for job := range in {
 		select {
 		case <-ctx.Done():
@@ -161,62 +163,59 @@ func runStageWorker(
 		default:
 		}
 
-		last := job.From - 1
+		chunkPath, written, err := processShardToCSV(
+			ctx,
+			src,
+			cfg,
+			columns,
+			job.From,
+			job.To,
+			secureDir,
+			loc,
+		)
+		if err != nil {
+			return fmt.Errorf("%s: %w", logPrefix, err)
+		}
 
-		for {
-			chunkPath, newLast, written, err := makeRequestAndWriteToCsv(
-				ctx,
-				src,
-				cfg,
-				columns,
-				last,
-				job.To,
-				secureDir,
-				loc,
-			)
-			if err != nil {
-				return fmt.Errorf("%s: %w", logPrefix, err)
-			}
+		// Если ничего не записано, скипаем, значит в заданном диапазоне ID ничего не найдено
+		if written == 0 {
+			continue
+		}
 
-			last = newLast
+		log.Printf("%s processed range [%d..%d]: %d rows", logPrefix, job.From, job.To, written)
 
-			log.Printf("%s - %v", logPrefix, job)
+		totalFiles.Add(1)
+		totalRows.Add(written)
 
-			totalFiles.Add(1)
-			totalRows.Add(written)
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case out <- loadJob{Path: chunkPath, Rows: written}:
-			}
-
-			if last >= job.To {
-				break
-			}
-
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case out <- loadJob{Path: chunkPath, Rows: written}:
 		}
 	}
 
 	return nil
 }
 
-func makeRequestAndWriteToCsv(
+// processShardToCSV считывает данные из исходной базы данных для заданного диапазона и записывает их в CSV
+func processShardToCSV(
 	ctx context.Context,
 	db *sql.DB,
-	cfg config.MigrateConfig,
+	cfg config.Config,
 	columns []string,
 	from, to uint64,
 	tmpDir string,
 	loc *time.Location,
-) (chunkPath string, newFrom, written uint64, err error) {
-	query := dbx.BuildSelectByRange(cfg.SrcTable, columns, cfg.SrcFilter)
+) (chunkPath string, written uint64, err error) {
+	// Отправляем запрос в БД-источник
+	query := dbx.BuildSelectByRange(cfg.SrcTable, columns, cfg.SrcNID, cfg.SrcFilter)
 	rows, err := db.QueryContext(ctx, query, from, to)
 	if err != nil {
-		return chunkPath, newFrom, written, fmt.Errorf("query error :%w", err)
+		return "", 0, fmt.Errorf("query error: %w", err)
 	}
 	defer rows.Close()
 
+	// Готовим переменные для хранения результатов запроса
 	cols, _ := rows.Columns()
 	values := make([]any, len(cols))
 	valuePointers := make([]any, len(cols))
@@ -224,59 +223,41 @@ func makeRequestAndWriteToCsv(
 		valuePointers[i] = &values[i]
 	}
 
-	chunkPath = filepath.Join(
-		tmpDir,
-		fmt.Sprintf("stage_%s_%d-%d_%d.csv", cfg.SrcTable, from, to, time.Now().UnixNano()),
-	)
-	csvFile, err := csv.New(chunkPath)
+	// Создаем структуру для записи данных в CSV
+	writer, err := stagewriter.New(tmpDir, cfg.SrcTable, from, to, cfg.TSColumnIdx-1, loc)
 	if err != nil {
-		return chunkPath, newFrom, written, fmt.Errorf("create tmp csv file: %w", err)
+		return "", 0, err
 	}
-	defer csvFile.Close()
+	defer writer.Close()
 
+	// Обходим полученные записи
 	for rows.Next() {
 		if err := rows.Scan(valuePointers...); err != nil {
-			return chunkPath, newFrom, written, fmt.Errorf("scan: %w", err)
+			writer.CleanupOnError()
+			return "", 0, fmt.Errorf("scan: %w", err)
 		}
 
-		uuid, err := createUuid(dbx.AsString(values[cfg.TSColumnIdx-1]), loc)
-		if err != nil {
-			return chunkPath, newFrom, written, fmt.Errorf("error creating UUID: %w", err)
-		}
-
-		outRec := make([]string, 0, len(values)+1)
-		outRec = append(outRec, uuid)
-		for _, v := range values {
-			outRec = append(outRec, dbx.AsString(v))
-		}
-
-		if err := csvFile.Write(outRec); err != nil {
-			return chunkPath, newFrom, written, fmt.Errorf("error writing CSV: %w", err)
-		}
-
-		written++
-
-		newFrom = to
-
-		// обновляем last по PK
-		if id, err := strconv.ParseUint(dbx.AsString(values[0]), 10, 64); err == nil && id > from {
-			newFrom = id
+		if err := writer.WriteRow(values); err != nil {
+			writer.CleanupOnError()
+			return "", 0, err
 		}
 	}
 
-	if err := csvFile.Flush(); err != nil {
-		return chunkPath, newFrom, written, err
+	// Если в процессе обхода возникла ошибка, нужно её выкинуть наружу
+	if err := rows.Err(); err != nil {
+		writer.CleanupOnError()
+		return "", 0, fmt.Errorf("rows iteration: %w", err)
 	}
 
-	if err := csvFile.Sync(); err != nil {
-		return chunkPath, newFrom, written, err
-	}
+	written = writer.RowsWritten()
 
+	// Удаляем пустые файлы
 	if written == 0 {
-		_ = os.Remove(chunkPath)
+		writer.CleanupOnError()
+		return "", 0, nil
 	}
 
-	return chunkPath, newFrom, written, nil
+	return writer.Path(), written, nil
 }
 
 // runLoadWorker запускает Load-воркера, который загружает данные из временного файла в целевую БД.
@@ -286,7 +267,7 @@ func runLoadWorker(
 	id int,
 	dst *sql.DB,
 	columns []string,
-	cfg config.MigrateConfig,
+	cfg config.Config,
 	in <-chan loadJob,
 	totalRows *atomic.Uint64,
 	totalFiles *atomic.Uint64,
@@ -300,62 +281,42 @@ func runLoadWorker(
 		default:
 		}
 
-		if err := loadDataInfile(ctx, dst, j.Path, cfg.DstTable, columns); err != nil {
+		log.Printf("%s start LOAD IN FILE %s", logPrefix, filepath.Base(j.Path))
+
+		if err := loadDataInfile(ctx, dst, j.Path, cfg.DstTable, cfg.DstUuid, columns, cfg.UseLocalInfile); err != nil {
 			return fmt.Errorf("%s LOAD DATA: %w", logPrefix, err)
 		}
 
 		totalFiles.Add(1)
 		totalRows.Add(j.Rows)
 		log.Printf("%s loaded %s (+%d rows)", logPrefix, filepath.Base(j.Path), j.Rows)
-
-		if err := os.Remove(j.Path); err != nil {
-			return err
-		}
 	}
 
 	return nil
 }
 
-func loadDataInfile(ctx context.Context, db *sql.DB, stagedPath, dstTable string, columns []string) error {
+func loadDataInfile(ctx context.Context, db *sql.DB, stagedPath, dstTable, uuidCol string, columns []string, useLocalInfile bool) error {
 	if len(columns) == 0 {
-		return fmt.Errorf("distanation table has no columns")
+		return fmt.Errorf("destination table has no columns")
 	}
 
-	vars := make([]string, 0, len(columns))
-	vars = append(vars, "@id_hex")
-	for i := 1; i < len(columns); i++ {
-		vars = append(vars, "@"+columns[i])
+	// Строим SQL для LOAD DATA INFILE или LOAD DATA LOCAL INFILE
+	loadSQL := dbx.BuildLoadDataSQL(stagedPath, dstTable, uuidCol, columns, useLocalInfile)
+	if loadSQL == "" {
+		return fmt.Errorf("failed to build LOAD DATA SQL")
 	}
 
-	setClauses := []string{"id=UNHEX(@id_hex)"}
-	for i := 1; i < len(columns); i++ {
-		col := columns[i]
-		if strings.EqualFold(col, "ins_ts") {
-			setClauses = append(setClauses,
-				fmt.Sprintf("%s=STR_TO_DATE(@%s,'%%Y-%%m-%%d %%H:%%i:%%s')", util.Ident(col), col))
-		} else {
-			setClauses = append(setClauses,
-				fmt.Sprintf("%s=NULLIF(@%s,'')", util.Ident(col), col))
-		}
-	}
+	// Запрос может быть достаточно долгим, поэтому лучше контекст обернуть с большим таймаутом
+	loadCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
 
-	file := strings.ReplaceAll(stagedPath, `\`, `\\`)
-	file = strings.ReplaceAll(file, `'`, `\'`)
-	loadSQL := fmt.Sprintf(
-		`
-			LOAD DATA INFILE '%s' INTO TABLE %s
-			FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\'
-			LINES TERMINATED BY '\n'
-			IGNORE 0 LINES
-			(%s)
-			SET %s
-		`,
-		file,
-		util.Ident(dstTable),
-		strings.Join(vars, ","),
-		strings.Join(setClauses, ", "),
-	)
-	_, err := db.ExecContext(ctx, loadSQL)
+	// Выполняем LOAD DATA INFILE
+	_, err := db.ExecContext(loadCtx, loadSQL)
+
+	// Удаляем файл ПОСЛЕ завершения ExecContext (в любом случае - успех или ошибка)
+	if removeErr := os.Remove(stagedPath); removeErr != nil {
+		log.Printf("[WARN] failed to remove %s: %v", stagedPath, removeErr)
+	}
 
 	return err
 }
@@ -365,7 +326,7 @@ func getMinMaxNID(
 	ctx context.Context,
 	srcDb,
 	dstDb *sql.DB,
-	cfg config.MigrateConfig,
+	cfg config.Config,
 ) (min uint64, max uint64, err error) {
 	dstMaxNID := dbx.MustMaxPk(ctx, dstDb, cfg.DstTable, cfg.DstNID)
 	srcMinID, srcMaxPk := dbx.MustPKRange(ctx, srcDb, cfg.SrcTable, cfg.SrcNID, cfg.SrcFilter)
@@ -382,20 +343,6 @@ func getMinMaxNID(
 	max = *srcMaxPk
 
 	return
-}
-
-// createUuid генерирует uuid на основе даты
-func createUuid(date string, loc *time.Location) (string, error) {
-	if date == "" {
-		return "", errors.New("empty datetime")
-	}
-
-	convertedDate, err := time.ParseInLocation(dateLayout, date, loc)
-	if err != nil {
-		return "", err
-	}
-
-	return uuidv7.FromTime(convertedDate)
 }
 
 // printStats печатает статистку миграции
