@@ -168,20 +168,20 @@ GOOS=linux GOARCH=amd64 go build -o logs-migrator ./cmd/migrator
 
 ### Отключаются проверки
 ```sql
-SET GLOBAL unique_checks = 0
-SET GLOBAL foreign_key_checks = 0
+SET GLOBAL unique_checks = 0;
+SET GLOBAL foreign_key_checks = 0;
 ```
 
 ### Отключается синхронизация
 ```sql
-SET GLOBAL innodb_flush_log_at_trx_commit = 2
-SET GLOBAL sync_binlog = 0
-SET SESSION sql_log_bin = 0
+SET GLOBAL innodb_flush_log_at_trx_commit = 2;
+SET GLOBAL sync_binlog = 0;
+SET SESSION sql_log_bin = 0;
 ```
 
 ### Отключается REDO LOG
 ```sql
-ALTER INSTANCE DISABLE INNODB REDO_LOG
+ALTER INSTANCE DISABLE INNODB REDO_LOG;
 ```
 
 ### Применяются пользовательские настройки

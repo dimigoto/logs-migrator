@@ -337,9 +337,11 @@ func ValidateWhereClause(where string) error {
 
 	upperWhere := strings.ToUpper(where)
 
-	// Проверяем ключевые слова
+	// Проверяем ключевые слова (только как отдельные слова, не как части других слов)
 	for _, keyword := range dangerousKeywords {
-		if strings.Contains(upperWhere, keyword) {
+		// Добавляем word boundary проверку с помощью regexp
+		pattern := regexp.MustCompile(`\b` + keyword + `\b`)
+		if pattern.MatchString(upperWhere) {
 			return fmt.Errorf("WHERE clause contains forbidden keyword: %s", keyword)
 		}
 	}
