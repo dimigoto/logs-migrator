@@ -38,6 +38,13 @@ func New(tmpDir, tableName string, fromID, toID uint64, tsColumnIndex int, tz *t
 		return nil, fmt.Errorf("create file: %w", err)
 	}
 
+	// Устанавливаем права 0644 (rw-r--r--) чтобы MySQL мог прочитать файл
+	if err := os.Chmod(path, 0644); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return nil, fmt.Errorf("chmod file: %w", err)
+	}
+
 	cw := csv.NewWriter(bufio.NewWriterSize(file, bufferSize))
 
 	return &StagedWriter{
