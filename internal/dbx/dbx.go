@@ -26,6 +26,7 @@ type OriginalSettings struct {
 	ForeignKeyChecks          int
 	InnodbFlushLogAtTrxCommit int
 	SyncBinlog                int
+	SqlLogBin                 int
 	InnodbIOCapacity          int
 	InnodbIOCapacityMax       int
 	InnodbBufferPoolSize      uint64
@@ -194,18 +195,20 @@ func EnableFastLoad(ctx context.Context, db *sql.DB, bufferPoolSize uint64, ioCa
 	orig.ForeignKeyChecks = getGlobalInt(ctx, db, "foreign_key_checks")
 	orig.InnodbFlushLogAtTrxCommit = getGlobalInt(ctx, db, "innodb_flush_log_at_trx_commit")
 	orig.SyncBinlog = getGlobalInt(ctx, db, "sync_binlog")
+	orig.SqlLogBin = getGlobalInt(ctx, db, "sql_log_bin")
 	orig.InnodbIOCapacity = getGlobalInt(ctx, db, "innodb_io_capacity")
 	orig.InnodbIOCapacityMax = getGlobalInt(ctx, db, "innodb_io_capacity_max")
 	orig.InnodbBufferPoolSize = getGlobalUint64(ctx, db, "innodb_buffer_pool_size")
 
-	log.Printf("[DEBUG] Original settings saved: unique_checks=%d, foreign_key_checks=%d, innodb_flush_log_at_trx_commit=%d, sync_binlog=%d, innodb_io_capacity=%d, innodb_io_capacity_max=%d, innodb_buffer_pool_size=%d",
-		orig.UniqueChecks, orig.ForeignKeyChecks, orig.InnodbFlushLogAtTrxCommit, orig.SyncBinlog, orig.InnodbIOCapacity, orig.InnodbIOCapacityMax, orig.InnodbBufferPoolSize)
+	log.Printf("[DEBUG] Original settings saved: unique_checks=%d, foreign_key_checks=%d, innodb_flush_log_at_trx_commit=%d, sync_binlog=%d, sql_log_bin=%d, innodb_io_capacity=%d, innodb_io_capacity_max=%d, innodb_buffer_pool_size=%d",
+		orig.UniqueChecks, orig.ForeignKeyChecks, orig.InnodbFlushLogAtTrxCommit, orig.SyncBinlog, orig.SqlLogBin, orig.InnodbIOCapacity, orig.InnodbIOCapacityMax, orig.InnodbBufferPoolSize)
 
 	// Применяем оптимизации
 	logExec(ctx, db, "SET GLOBAL unique_checks = 0")
 	logExec(ctx, db, "SET GLOBAL foreign_key_checks = 0")
 	logExec(ctx, db, "SET GLOBAL innodb_flush_log_at_trx_commit = 2")
 	logExec(ctx, db, "SET GLOBAL sync_binlog = 0")
+	logExec(ctx, db, "SET GLOBAL sql_log_bin = 0")
 
 	// Применяем пользовательские настройки InnoDB если указаны
 	if bufferPoolSize > 0 {
@@ -217,9 +220,6 @@ func EnableFastLoad(ctx context.Context, db *sql.DB, bufferPoolSize uint64, ioCa
 	if ioCapacityMax > 0 {
 		logExec(ctx, db, fmt.Sprintf("SET GLOBAL innodb_io_capacity_max = %d", ioCapacityMax))
 	}
-
-	// Отключаем binlog для сессии
-	logExec(ctx, db, "SET SESSION sql_log_bin = 0")
 
 	// Отключаем REDO LOG
 	logExec(ctx, db, "ALTER INSTANCE DISABLE INNODB REDO_LOG")
@@ -237,10 +237,8 @@ func DisableFastLoad(db *sql.DB, orig *OriginalSettings) {
 	// Включаем REDO LOG
 	logExec(ctx, db, "ALTER INSTANCE ENABLE INNODB REDO_LOG")
 
-	// Включаем binlog обратно
-	logExec(ctx, db, "SET SESSION sql_log_bin = 1")
-
 	// Восстанавливаем оригинальные значения
+	logExec(ctx, db, fmt.Sprintf("SET GLOBAL sql_log_bin = %d", orig.SqlLogBin))
 	logExec(ctx, db, fmt.Sprintf("SET GLOBAL innodb_flush_log_at_trx_commit = %d", orig.InnodbFlushLogAtTrxCommit))
 	logExec(ctx, db, fmt.Sprintf("SET GLOBAL sync_binlog = %d", orig.SyncBinlog))
 	logExec(ctx, db, fmt.Sprintf("SET GLOBAL innodb_io_capacity = %d", orig.InnodbIOCapacity))
