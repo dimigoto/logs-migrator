@@ -55,7 +55,7 @@ func ParseConfig(args []string) Config {
 	fs.StringVar(&c.DstUuid, "dst-uuid", "id", "Destination table UUID column name (default: id)")
 
 	fs.IntVar(&c.TSColumnIdx, "ts-idx", 2, "The position of the column in source table that contains the date used to generate the UUIDv7 (default: 2)")
-	fs.StringVar(&c.UUIDTZ, "uuid-tz", "America/Los_Angeles", "Destination table (default: America/Los_Angeles)")
+	fs.StringVar(&c.UUIDTZ, "uuid-tz", "UTC", "Destination table (default: UTC)")
 
 	fs.IntVar(&c.StageWorkers, "sw", runtime.NumCPU(), "Parallel stage workers")
 	fs.IntVar(&c.LoadWorkers, "lw", runtime.NumCPU(), "Parallel load workers")

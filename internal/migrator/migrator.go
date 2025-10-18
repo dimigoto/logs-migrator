@@ -10,7 +10,6 @@ import (
 	"logs-migrator/internal/ranger"
 	"logs-migrator/internal/stagewriter"
 	"logs-migrator/internal/util"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -25,14 +24,15 @@ func Run(
 	cfg config.Config,
 ) error {
 	// Определяем минимальный и максимальный ID записей, которые нужно мигрировать
-	minPk, maxPk, err := getMinMaxNID(ctx, srcDb, dstDb, cfg)
-	if err != nil {
-		return err
+	minID, maxID := getMinMaxSrcID(ctx, srcDb, dstDb, cfg)
+	if minID == 0 && maxID == 0 {
+		log.Printf("[INFO] no new rows to migrate\n")
+		return nil
 	}
-	log.Printf("[INFO] numeric ID range: %d - %d\n", minPk, maxPk)
+	log.Printf("[INFO] numeric ID range: %d - %d\n", minID, maxID)
 
 	// Разбиваем на шарды
-	shards := ranger.Split(minPk, maxPk, uint64(cfg.ChunkSize))
+	shards := ranger.Split(minID, maxID, uint64(cfg.ChunkSize))
 	log.Printf("[INFO] shards: %d\n", len(shards))
 
 	// Получаем список колонок табьлицы-источника и целеной таблицы
@@ -89,7 +89,7 @@ func Run(
 		id := i + 1
 		go func(id int) {
 			defer loadWG.Done()
-			if err := runLoadWorker(workersCtx, id, dstDb, dstTableColumns, cfg, loadJobs, &totalLoaded, &filesLoaded); err != nil {
+			if err := runLoadWorker(workersCtx, id, dstDb, dstTableColumns, cfg, secureDir, loadJobs, &totalLoaded, &filesLoaded); err != nil {
 				select {
 				case errs <- err:
 					cancelWork()
@@ -268,6 +268,7 @@ func runLoadWorker(
 	dst *sql.DB,
 	columns []string,
 	cfg config.Config,
+	secureDir string,
 	in <-chan loadJob,
 	totalRows *atomic.Uint64,
 	totalFiles *atomic.Uint64,
@@ -283,7 +284,7 @@ func runLoadWorker(
 
 		log.Printf("%s start LOAD IN FILE %s", logPrefix, filepath.Base(j.Path))
 
-		if err := loadDataInfile(ctx, dst, j.Path, cfg.DstTable, cfg.DstUuid, columns, cfg.UseLocalInfile); err != nil {
+		if err := loadDataInfile(ctx, dst, j.Path, secureDir, cfg.DstTable, cfg.DstUuid, columns, cfg.UseLocalInfile); err != nil {
 			return fmt.Errorf("%s LOAD DATA: %w", logPrefix, err)
 		}
 
@@ -295,7 +296,7 @@ func runLoadWorker(
 	return nil
 }
 
-func loadDataInfile(ctx context.Context, db *sql.DB, stagedPath, dstTable, uuidCol string, columns []string, useLocalInfile bool) error {
+func loadDataInfile(ctx context.Context, db *sql.DB, stagedPath, secureDir, dstTable, uuidCol string, columns []string, useLocalInfile bool) error {
 	if len(columns) == 0 {
 		return fmt.Errorf("destination table has no columns")
 	}
@@ -313,36 +314,33 @@ func loadDataInfile(ctx context.Context, db *sql.DB, stagedPath, dstTable, uuidC
 	// Выполняем LOAD DATA INFILE
 	_, err := db.ExecContext(loadCtx, loadSQL)
 
-	// Удаляем файл ПОСЛЕ завершения ExecContext (в любом случае - успех или ошибка)
-	if removeErr := os.Remove(stagedPath); removeErr != nil {
+	// Безопасно удаляем файл ПОСЛЕ завершения ExecContext (в любом случае - успех или ошибка)
+	if removeErr := util.SafeRemove(stagedPath, secureDir); removeErr != nil {
 		log.Printf("[WARN] failed to remove %s: %v", stagedPath, removeErr)
 	}
 
 	return err
 }
 
-// getMinMaxNID расчитывает минимальный и максимальный числовой ID
-func getMinMaxNID(
+// getMinMaxSrcID расчитывает минимальный и максимальный числовой ID
+func getMinMaxSrcID(
 	ctx context.Context,
 	srcDb,
 	dstDb *sql.DB,
 	cfg config.Config,
-) (min uint64, max uint64, err error) {
+) (uint64, uint64) {
 	dstMaxNID := dbx.MustMaxPk(ctx, dstDb, cfg.DstTable, cfg.DstNID)
-	srcMinID, srcMaxPk := dbx.MustPKRange(ctx, srcDb, cfg.SrcTable, cfg.SrcNID, cfg.SrcFilter)
+	minID, maxID := dbx.MustPKRange(ctx, srcDb, cfg.SrcTable, cfg.SrcNID, cfg.SrcFilter)
 
-	if srcMinID == nil || srcMaxPk == nil || *srcMaxPk <= *srcMinID || *srcMaxPk <= *dstMaxNID {
-		return 0, 0, fmt.Errorf("[INFO] No rows")
+	if maxID == 0 || maxID < minID || maxID <= dstMaxNID {
+		return 0, 0
 	}
 
-	min = *srcMinID
-	if dstMaxNID != nil && *srcMinID < *dstMaxNID {
-		min = *dstMaxNID
+	if minID <= dstMaxNID {
+		minID = dstMaxNID + 1
 	}
 
-	max = *srcMaxPk
-
-	return
+	return minID, maxID
 }
 
 // printStats печатает статистку миграции

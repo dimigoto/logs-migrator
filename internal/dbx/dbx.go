@@ -69,7 +69,7 @@ func GetSecureFilePriv(ctx context.Context, db *sql.DB) string {
 	return strings.TrimSpace(serverPriv.String)
 }
 
-func MustMaxPk(ctx context.Context, db *sql.DB, tableName, pkColumnName string) *uint64 {
+func MustMaxPk(ctx context.Context, db *sql.DB, tableName, pkColumnName string) uint64 {
 	query := fmt.Sprintf(
 		"SELECT MAX(%s) FROM %s",
 		util.Ident(pkColumnName),
@@ -84,15 +84,17 @@ func MustMaxPk(ctx context.Context, db *sql.DB, tableName, pkColumnName string) 
 	}
 
 	if !nid.Valid {
-		return &empty
+		return empty
 	}
 
 	result := uint64(nid.Int64)
 
-	return &result
+	return result
 }
 
-func MustPKRange(ctx context.Context, db *sql.DB, tableName, pkColumnName, filter string) (*uint64, *uint64) {
+func MustPKRange(ctx context.Context, db *sql.DB, tableName, pkColumnName, filter string) (uint64, uint64) {
+	var empty uint64 = 0
+
 	where := strings.TrimSpace(filter)
 
 	q := fmt.Sprintf(
@@ -113,13 +115,13 @@ func MustPKRange(ctx context.Context, db *sql.DB, tableName, pkColumnName, filte
 	}
 
 	if !a.Valid || !b.Valid {
-		return nil, nil
+		return empty, empty
 	}
 
 	from := uint64(a.Int64)
 	to := uint64(b.Int64)
 
-	return &from, &to
+	return from, to
 }
 
 func MustTableColumns(ctx context.Context, db *sql.DB, table string) []string {

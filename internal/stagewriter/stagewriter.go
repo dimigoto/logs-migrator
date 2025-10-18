@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/csv"
 	"fmt"
+	"logs-migrator/internal/util"
 	"logs-migrator/internal/uuidv7"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ type StagedWriter struct {
 	file          *os.File
 	cw            *csv.Writer
 	path          string
+	baseDir       string
 	tsColumnIndex int
 	tz            *time.Location
 	rowsWritten   uint64
@@ -51,6 +53,7 @@ func New(tmpDir, tableName string, fromID, toID uint64, tsColumnIndex int, tz *t
 		file:          file,
 		cw:            cw,
 		path:          path,
+		baseDir:       tmpDir,
 		tsColumnIndex: tsColumnIndex,
 		tz:            tz,
 		rowsWritten:   0,
@@ -59,17 +62,29 @@ func New(tmpDir, tableName string, fromID, toID uint64, tsColumnIndex int, tz *t
 
 // WriteRow записывает строку, добавляя в её начало UUID, сгенерированный из столбца с временной меткой
 func (sw *StagedWriter) WriteRow(values []any) error {
-	// Получаем TS
+	// Получаем TS и преобразуем в time.Time
 	tsValue := values[sw.tsColumnIndex]
-	tsStr := asString(tsValue)
-	if tsStr == "" {
-		return fmt.Errorf("empty timestamp at index %d", sw.tsColumnIndex)
-	}
 
-	// Парсим TS
-	ts, err := time.ParseInLocation(dateLayout, tsStr, sw.tz)
-	if err != nil {
-		return fmt.Errorf("parse timestamp: %w", err)
+	var ts time.Time
+	var err error
+
+	// Обрабатываем разные типы timestamp
+	switch v := tsValue.(type) {
+	case time.Time:
+		// Если MySQL driver вернул time.Time (когда parseTime=true в DSN),
+		// конвертируем в указанную таймзону
+		ts = v.In(sw.tz)
+	default:
+		// Для всех остальных случаев ([]byte, string, и т.д.)
+		// конвертируем в string и парсим
+		tsStr := asString(v)
+		if tsStr == "" {
+			return fmt.Errorf("empty timestamp at index %d", sw.tsColumnIndex)
+		}
+		ts, err = time.ParseInLocation(dateLayout, tsStr, sw.tz)
+		if err != nil {
+			return fmt.Errorf("parse timestamp: %w", err)
+		}
 	}
 
 	// Генерируем UUIDv7
@@ -119,9 +134,9 @@ func (sw *StagedWriter) RowsWritten() uint64 {
 	return sw.rowsWritten
 }
 
-// CleanupOnError удаляет файл
+// CleanupOnError безопасно удаляет файл
 func (sw *StagedWriter) CleanupOnError() {
-	_ = os.Remove(sw.path)
+	_ = util.SafeRemove(sw.path, sw.baseDir)
 }
 
 // asString конвертирует любые значения в string
@@ -132,7 +147,9 @@ func asString(value any) string {
 	case []byte:
 		return string(x)
 	case time.Time:
-		return x.UTC().Format(dateLayout)
+		// ВАЖНО: НЕ конвертируем в UTC, сохраняем время "как есть"
+		// Это нужно, потому что позже мы парсим строку с правильной таймзоной
+		return x.Format(dateLayout)
 	default:
 		return fmt.Sprint(x)
 	}
