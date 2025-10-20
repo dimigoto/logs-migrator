@@ -275,6 +275,15 @@ func runLoadWorker(
 ) error {
 	logPrefix := fmt.Sprintf("[LOAD#%d]", id)
 
+	// Отключаем binlog для этой сессии воркера (если включен fast-load)
+	if cfg.UseFastLoad {
+		if _, err := dst.ExecContext(ctx, "SET SESSION sql_log_bin = 0"); err != nil {
+			log.Printf("%s [WARN] failed to disable binlog for session: %v", logPrefix, err)
+		} else {
+			log.Printf("%s binlog disabled for this session", logPrefix)
+		}
+	}
+
 	for j := range in {
 		select {
 		case <-ctx.Done():
